@@ -142,8 +142,20 @@ def compute_quote(inp: QuoteInputs, f: SymbolFilters, cfg: QuoteConfig) -> Optio
     pos = inp.position
     pos_abs = abs(pos)
 
-    def opening(px: float, ratio_same_side: float) -> Optional[Side]:
+    # Дисбаланс очереди на лучших ценах: доля объёма на bid. На монетах,
+    # где спред = 1 тик, это лучший краткосрочный прогноз: при слабой
+    # очереди bid (qi мало) следующий шаг цены скорее вниз — стоять в этой
+    # очереди значит получить исполнение прямо перед падением.
+    qi = inp.bid_qty / tot if tot > 0 else 0.5
+
+    def opening(px: float, ratio_same_side: float, side: str) -> Optional[Side]:
         if not inp.allow_open or px <= 0:
+            return None
+        # Фильтр действует и на заявки глубже лучшей цены: они исполняются,
+        # когда рынок пробивает уровень, — то есть как раз при движении против нас.
+        if side == "BUY" and (qi < cfg.qi_join_min or inp.flow_imb < -cfg.flow_block):
+            return None
+        if side == "SELL" and ((1 - qi) < cfg.qi_join_min or inp.flow_imb > cfg.flow_block):
             return None
         scale = 1.0 - max(0.0, ratio_same_side)
         q = round_to(base_qty * scale, f.step, up=False)
@@ -165,14 +177,14 @@ def compute_quote(inp: QuoteInputs, f: SymbolFilters, cfg: QuoteConfig) -> Optio
         size_ratio = max(-1.0, min(1.0, pos * ref / inp.max_inventory_usdt))
 
     if pos > 0:
-        bid = opening(bid_px, size_ratio)
+        bid = opening(bid_px, size_ratio, "BUY")
         ask = reducing(ask_px)
     elif pos < 0:
         bid = reducing(bid_px)
-        ask = opening(ask_px, -size_ratio)
+        ask = opening(ask_px, -size_ratio, "SELL")
     else:
-        bid = opening(bid_px, 0.0)
-        ask = opening(ask_px, 0.0)
+        bid = opening(bid_px, 0.0, "BUY")
+        ask = opening(ask_px, 0.0, "SELL")
 
     return Quote(bid, ask, fair, res, half, alpha, skew)
 

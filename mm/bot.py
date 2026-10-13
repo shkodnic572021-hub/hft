@@ -60,6 +60,7 @@ class SymbolTrader:
         self.stopping = False
         self.running = True
         self.fills = 0
+        self.added_at = time.time()
         self.last_quote = None
         self._last_step = 0.0
         self._mismatch = 0
@@ -207,6 +208,21 @@ class SymbolTrader:
                     f"{mk.avg_net(self.symbol):+.2f}bps за {mk.count(self.symbol)} fills"
                 )
                 self._pause(r.toxic_pause_s, "toxic flow")
+
+        # 3b. Выгодна ли монета по живым данным — та же формула, что в сканере
+        sc = self.cfg.scanner
+        if (not self.rotate_requested and now - self.added_at > 120
+                and book.median_spread_bps > 0 and book.vol_slow.ready):
+            sigma_1m = book.vol_slow.sigma_bps * 60 ** 0.5
+            live_net = (book.median_spread_bps / 2 - self.cfg.exchange.maker_fee_bps
+                        - sc.adverse_coef * sigma_1m)
+            if live_net < 0:
+                self.rotate_requested = True
+                logger.warning(
+                    f"📉 {self.symbol}: не окупается на живых данных — спред "
+                    f"{book.median_spread_bps:.1f}bps, σ1m {sigma_1m:.1f}bps, "
+                    f"net {live_net:+.1f}bps → ротация"
+                )
 
         # 4. Убыток по монете
         if pnl.net_pnl < -r.symbol_max_loss_usdt and not self.rotate_requested:

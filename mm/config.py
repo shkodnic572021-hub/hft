@@ -63,7 +63,7 @@ class ScannerConfig:
     max_volume_24h_usdt: float = 1_500_000_000
 
     # Памп/дамп-монеты = тренд = убыток маркет-мейкера.
-    max_abs_change_24h_pct: float = 25.0
+    max_abs_change_24h_pct: float = 15.0
     # Доля направленного движения за последний час (efficiency ratio):
     # |сумма доходностей| / сумма |доходностей|. 1 = чистый тренд.
     max_trend_ratio: float = 0.35
@@ -75,11 +75,14 @@ class ScannerConfig:
 
     # Оценка: net_bps = spread/2 − maker_fee − adverse_coef·σ_1m
     # score = net_bps · sqrt(trades_per_min)
-    adverse_coef: float = 0.10
-    min_net_bps: float = 0.5
+    # 0.25: за время удержания (десятки секунд) цена в среднем проходит
+    # заметную долю σ_1m — при 0.1 сканер выбирал монеты, где один тик
+    # движения против позиции съедал весь спред.
+    adverse_coef: float = 0.25
+    min_net_bps: float = 1.0
 
-    spread_samples: int = 5             # сколько снимков bookTicker брать
-    spread_sample_interval_sec: float = 1.0
+    spread_samples: int = 10            # сколько снимков bookTicker брать
+    spread_sample_interval_sec: float = 0.5
     max_kline_candidates: int = 40      # для скольких монет грузить свечи
 
     rescan_interval_sec: int = 900
@@ -107,6 +110,12 @@ class QuoteConfig:
     k_flow_bps: float = 1.5             # дисбаланс потока сделок, [-1..1]
     max_alpha_bps: float = 4.0
     flow_halflife_s: float = 2.0
+
+    # Вход разрешён, только если очередь «нашей» стороны
+    # не слабая (доля объёма на лучшем уровне ≥ qi_join_min) и поток
+    # агрессивных сделок не идёт против (|flow_imb| < flow_block).
+    qi_join_min: float = 0.40
+    flow_block: float = 0.60
 
     # Управление инвентарём
     skew_max_bps: float = 6.0           # сдвиг котировок при полной позиции

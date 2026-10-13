@@ -83,7 +83,7 @@ def test_no_open_only_reduces():
 
 def test_post_only_never_crosses():
     # сильный alpha вверх не должен сделать bid ≥ ask
-    q = compute_quote(inputs(flow_imb=1.0, depth_imb=1.0, bid_qty=1, ask_qty=1e6), F, QuoteConfig())
+    q = compute_quote(inputs(flow_imb=0.5, depth_imb=1.0, bid_qty=1000, ask_qty=1000), F, QuoteConfig())
     assert q.bid.price <= 1.0001 - F.tick + 1e-12
     assert q.ask.price >= 0.9999 + F.tick - 1e-12
 
@@ -390,3 +390,56 @@ async def _tick_symbol(self, symbol):
     px = round(self.mid + (-1 if side else 1) * 0.0003 * self.rng.uniform(0, 3), 5)
     self.book.on_trade(px, 10, side, now)
     await self.ex.on_trade(symbol, px, 10, side, now)
+
+
+# ---------------------------------------------------------------- после live-лога KGENUSDT
+
+KGEN_F = SymbolFilters(tick=0.0001, step=1.0, min_qty=1.0, min_notional=5.0)
+
+
+def kgen_inputs(**kw):
+    # 1 тик = 8.7 bps, спред = 1 тик, как в логе
+    d = dict(bid=0.1147, ask=0.1148, bid_qty=5000, ask_qty=5000, sigma_1s_bps=5.0)
+    d.update(kw)
+    return inputs(**d)
+
+
+def test_weak_bid_queue_blocks_joining_bid():
+    q = compute_quote(kgen_inputs(bid_qty=500, ask_qty=9500), KGEN_F, QuoteConfig())
+    assert q.bid is None          # очередь bid тает — цена скорее пойдёт вниз
+    assert q.ask is not None      # продавать в этот момент можно
+
+
+def test_weak_ask_queue_blocks_joining_ask():
+    q = compute_quote(kgen_inputs(bid_qty=9500, ask_qty=500), KGEN_F, QuoteConfig())
+    assert q.ask is None and q.bid is not None
+
+
+def test_adverse_flow_blocks_side():
+    q = compute_quote(kgen_inputs(flow_imb=-0.9), KGEN_F, QuoteConfig())
+    assert q.bid is None and q.ask is not None
+
+
+def test_balanced_queue_quotes_both():
+    q = compute_quote(kgen_inputs(), KGEN_F, QuoteConfig())
+    assert q.bid is not None and q.ask is not None
+
+
+def test_exit_not_blocked_by_queue_filter():
+    q = compute_quote(kgen_inputs(bid_qty=9500, ask_qty=500, position=52, avg_entry=0.1147),
+                      KGEN_F, QuoteConfig())
+    assert q.ask is not None and q.ask.reduce_only
+
+
+def test_scanner_rejects_candidates_from_live_log():
+    """Цифры из лога: KGEN (σ1m 32.8 при спреде 17.5) должна отсеиваться."""
+    cfg = BotConfig()
+    rows = {   # spread_bps, trades/min, σ1m
+        "KGENUSDT": (17.47, 156, 32.8),
+        "ONUSDT": (15.07, 40, 29.8),
+        "GRAMUSDT": (7.26, 39, 8.6),
+    }
+    for sym, (sp, tpm, sig) in rows.items():
+        c = Candidate(sym, spread_bps=sp, trades_per_min=tpm, sigma_1m_bps=sig)
+        score_candidate(c, 2.0, cfg.scanner.adverse_coef)
+        assert c.net_bps < cfg.scanner.min_net_bps, sym
