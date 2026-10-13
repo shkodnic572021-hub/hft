@@ -87,6 +87,10 @@ class BaseExchange:
     def filters(self, symbol: str) -> Optional[SymbolFilters]:
         return self._filters.get(symbol)
 
+    async def load_fees(self):
+        """Фактические комиссии аккаунта (только live, нужен ключ)."""
+        return
+
     async def funding_info(self, symbol: str) -> Tuple[float, float]:
         """(nextFundingTime в секундах, lastFundingRate)."""
         try:
@@ -131,6 +135,15 @@ class LiveExchange(BaseExchange):
     async def balance(self) -> float:
         acc = await self.client.futures_account()
         return float(acc["totalWalletBalance"])
+
+    async def load_fees(self):
+        try:
+            r = await self.client.futures_commission_rate(symbol=self.cfg.risk.btc_symbol)
+            e = self.cfg.exchange
+            e.maker_fee_bps = float(r["makerCommissionRate"]) * 1e4
+            e.taker_fee_bps = float(r["takerCommissionRate"]) * 1e4
+        except Exception as ex:
+            logger.warning(f"Комиссии не получены, беру из конфига: {ex}")
 
     async def setup_symbol(self, symbol: str) -> int:
         e = self.cfg.exchange

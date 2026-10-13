@@ -79,31 +79,46 @@ class Scanner:
 
     async def scan(self) -> List[Candidate]:
         s = self.cfg.scanner
+        maker = self.cfg.exchange.maker_fee_bps
         tickers = await self.client.futures_ticker()
         premium = await self.client.futures_mark_price()
         funding = {p["symbol"]: float(p.get("lastFundingRate", 0) or 0) for p in premium}
 
+        # Воронка: сколько монет отсеяно на каждом шаге — чтобы было видно,
+        # какой фильтр «душит» отбор на текущем рынке.
+        funnel: Dict[str, int] = {}
+
+        def drop(reason: str):
+            funnel[reason] = funnel.get(reason, 0) + 1
+
         cands: Dict[str, Candidate] = {}
+        total = 0
         for t in tickers:
             sym = t["symbol"]
             if not sym.endswith(s.quote_asset) or sym in s.exclude_symbols:
                 continue
             if self.filters(sym) is None:
                 continue
+            total += 1
             try:
                 vol = float(t["quoteVolume"])
                 chg = float(t["priceChangePercent"])
             except (KeyError, ValueError):
                 continue
-            if not (s.min_volume_24h_usdt <= vol <= s.max_volume_24h_usdt):
+            if vol < s.min_volume_24h_usdt:
+                drop("объём мал")
+                continue
+            if vol > s.max_volume_24h_usdt:
+                drop("объём велик (топ)")
                 continue
             if abs(chg) > s.max_abs_change_24h_pct:
+                drop("памп/дамп 24ч")
                 continue
             f = funding.get(sym, 0.0)
             if abs(f) > s.max_abs_funding:
+                drop("funding")
                 continue
             cands[sym] = Candidate(sym, vol, chg, funding=f)
-        logger.info(f"🔍 Сканер: {len(cands)} монет после фильтра объёма/изменения/funding")
 
         # Медианный спред по нескольким снимкам bookTicker
         samples: Dict[str, List[float]] = {k: [] for k in cands}
@@ -122,18 +137,23 @@ class Scanner:
                 if b > 0 and a > b:
                     samples[sym].append((a - b) / ((a + b) / 2) * 1e4)
                     ticks[sym].append((a - b) / self.filters(sym).tick)
-        for sym, c in list(cands.items()):
+        spread_ok: List[Candidate] = []
+        near_miss: List[Candidate] = []
+        for sym, c in cands.items():
             if not samples[sym]:
-                del cands[sym]
                 continue
             c.spread_bps = median(samples[sym])
             c.spread_ticks = median(ticks[sym])
             if c.spread_bps < s.min_spread_bps:
-                del cands[sym]
+                drop(f"спред < {s.min_spread_bps:g}bps")
+                near_miss.append(c)
+            else:
+                spread_ok.append(c)
 
         # Свечи — только для лучших по предварительной оценке (лимиты API)
-        maker = self.cfg.exchange.maker_fee_bps
-        pre = sorted(cands.values(), key=lambda c: c.spread_bps / 2 - maker, reverse=True)
+        pre = sorted(spread_ok, key=lambda c: c.spread_bps, reverse=True)
+        for c in pre[s.max_kline_candidates:]:
+            drop("вне лимита свечей")
         pre = pre[: s.max_kline_candidates]
         sem = asyncio.Semaphore(8)
 
@@ -150,19 +170,36 @@ class Scanner:
         await asyncio.gather(*[enrich(c) for c in pre])
 
         out = []
+        rejected: List[tuple] = []
         for c in pre:
-            if c.trades_per_min < s.min_trades_per_min:
-                continue
-            if c.sigma_1m_bps <= 0 or c.sigma_1m_bps > s.max_sigma_1m_bps:
-                continue
-            if c.trend > s.max_trend_ratio:
-                continue
             score_candidate(c, maker, s.adverse_coef)
-            if c.net_bps < s.min_net_bps:
+            if c.trades_per_min < s.min_trades_per_min:
+                reason = f"сделок/мин < {s.min_trades_per_min:g}"
+            elif c.sigma_1m_bps <= 0 or c.sigma_1m_bps > s.max_sigma_1m_bps:
+                reason = f"σ1m > {s.max_sigma_1m_bps:g}bps"
+            elif c.trend > s.max_trend_ratio:
+                reason = f"тренд > {s.max_trend_ratio:g}"
+            elif c.net_bps < s.min_net_bps:
+                reason = "спред не окупает комиссию"
+            else:
+                out.append(c)
                 continue
-            out.append(c)
+            drop(reason)
+            rejected.append((c, reason))
         out.sort(key=lambda c: c.score, reverse=True)
-        logger.info(f"🔍 Подходят: {len(out)}")
+
+        logger.info(
+            f"🔍 Сканер: {total} монет → прошли {len(out)} | отсеяно: "
+            + ", ".join(f"{k}: {v}" for k, v in sorted(funnel.items(), key=lambda x: -x[1]))
+        )
         for c in out[:10]:
-            logger.info(f"   {c}")
+            logger.info(f"   ✅ {c}")
+        if not out:
+            # Показать, кто был ближе всего — по этим данным видно,
+            # какой порог мешает на текущем рынке.
+            for c, reason in sorted(rejected, key=lambda x: -x[0].spread_bps)[:5]:
+                logger.info(f"   ✗ {reason}: {c}")
+            for c in sorted(near_miss, key=lambda c: -c.spread_bps)[:5]:
+                logger.info(f"   ✗ спред: {c.symbol} {c.spread_bps:.2f}bps "
+                            f"({c.spread_ticks:.1f} тика) vol=${c.volume_24h/1e6:.0f}M")
         return out

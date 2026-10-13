@@ -29,7 +29,8 @@ class ExchangeConfig:
     leverage: int = 5
     margin_type: str = "ISOLATED"
 
-    # Комиссии VIP0 USDⓈ-M. Поменяйте, если у вас другой уровень/скидка BNB.
+    # Комиссии VIP0 USDⓈ-M. В live-режиме при старте подтягиваются
+    # фактические ставки аккаунта через API (без учёта скидки BNB).
     # Вся стратегия считает прибыль ПОСЛЕ этих комиссий.
     maker_fee_bps: float = 2.0
     taker_fee_bps: float = 5.0
@@ -58,7 +59,7 @@ class ScannerConfig:
 
     # Объём: снизу — чтобы были исполнения, сверху — топ-монеты, где спред
     # 1 тик и очередь занята колоцированными HFT (с 65 мс там не выиграть).
-    min_volume_24h_usdt: float = 30_000_000
+    min_volume_24h_usdt: float = 5_000_000
     max_volume_24h_usdt: float = 1_500_000_000
 
     # Памп/дамп-монеты = тренд = убыток маркет-мейкера.
@@ -68,7 +69,7 @@ class ScannerConfig:
     max_trend_ratio: float = 0.35
 
     min_spread_bps: float = 3.0         # медианный спред
-    min_trades_per_min: float = 30.0    # сделок в минуту (по 1m свечам)
+    min_trades_per_min: float = 10.0    # сделок в минуту (по 1m свечам)
     max_sigma_1m_bps: float = 35.0      # волатильность 1-минутных доходностей
     max_abs_funding: float = 0.0005     # 0.05% за период
 
@@ -82,6 +83,7 @@ class ScannerConfig:
     max_kline_candidates: int = 40      # для скольких монет грузить свечи
 
     rescan_interval_sec: int = 900
+    empty_rescan_sec: int = 60          # если монет нет — повтор не чаще
     rotate_score_mult: float = 1.3      # новая монета должна быть лучше на 30%
 
 

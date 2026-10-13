@@ -520,9 +520,11 @@ class Bot:
         last_scan = time.time()
         while self.running:
             await asyncio.sleep(10)
+            since = time.time() - last_scan
             need = any(t.rotate_requested for t in self.traders.values()) \
-                or len(self.traders) < self.cfg.max_symbols \
-                or time.time() - last_scan >= self.cfg.scanner.rescan_interval_sec
+                or since >= self.cfg.scanner.rescan_interval_sec \
+                or (len(self.traders) < self.cfg.max_symbols
+                    and since >= self.cfg.scanner.empty_rescan_sec)
             if not need:
                 continue
             last_scan = time.time()
@@ -567,6 +569,9 @@ class Bot:
         self.running = True
         self.initial_balance = await self.ex.balance()
         logger.info(f"💰 Баланс: {self.initial_balance:.2f} USDT")
+        await self.ex.load_fees()
+        e = self.cfg.exchange
+        logger.info(f"💸 Комиссии: maker {e.maker_fee_bps:.2f}bps, taker {e.taker_fee_bps:.2f}bps")
         self.scanner = Scanner(self.ex.client, self.cfg, self.ex.filters)
         self.md.subscribe(self.cfg.risk.btc_symbol, trades=False, depth=False)
 
