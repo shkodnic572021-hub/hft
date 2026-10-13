@@ -12,3 +12,7 @@ __pycache__/
 *.pyc
 .venv/
 venv/
+
+# Логи нового бота
+logs/
+.pytest_cache/

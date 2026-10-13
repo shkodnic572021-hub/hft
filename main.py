@@ -1,71 +1,127 @@
+"""
+Маркет-мейкер Binance USDⓈ-M.
+
+  python main.py                      # бумажная торговля, монеты выбирает сканер
+  python main.py --symbols DOGEUSDT   # бумажная торговля на заданной монете
+  python main.py --scan               # только показать рейтинг монет
+  python main.py --live               # реальная торговля (нужен key.env)
+"""
+
+import argparse
 import asyncio
 import logging
-from config import BotConfig
-from market_maker import MultiMarketMakerBot
+import os
+import signal
+import sys
+from logging.handlers import RotatingFileHandler
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
-logger = logging.getLogger(__name__)
+from mm.bot import Bot
+from mm.config import BotConfig
+
+
+def setup_logging(level: str, log_dir: str):
+    os.makedirs(log_dir, exist_ok=True)
+    fmt = logging.Formatter("%(asctime)s.%(msecs)03d | %(levelname)-8s | %(name)s | %(message)s",
+                            "%Y-%m-%d %H:%M:%S")
+    root = logging.getLogger()
+    root.setLevel(getattr(logging, level.upper()))
+    sh = logging.StreamHandler(sys.stdout)
+    sh.setFormatter(fmt)
+    fh = RotatingFileHandler(os.path.join(log_dir, "bot.log"), maxBytes=50_000_000,
+                             backupCount=5, encoding="utf-8")
+    fh.setFormatter(fmt)
+    root.addHandler(sh)
+    root.addHandler(fh)
+    logging.getLogger("websockets").setLevel(logging.WARNING)
+
+
+def parse_args():
+    p = argparse.ArgumentParser(description="Binance USDⓈ-M market maker")
+    p.add_argument("--live", action="store_true", help="реальная торговля (по умолчанию paper)")
+    p.add_argument("--scan", action="store_true", help="только просканировать рынок и выйти")
+    p.add_argument("--symbols", default="", help="монеты через запятую (иначе сканер)")
+    p.add_argument("--max-symbols", type=int, default=None)
+    p.add_argument("--order-usdt", type=float, default=None)
+    p.add_argument("--max-inventory-usdt", type=float, default=None)
+    p.add_argument("--paper-balance", type=float, default=None)
+    p.add_argument("--log-level", default="INFO")
+    return p.parse_args()
+
+
+async def run_scan(cfg: BotConfig):
+    from mm.exchange import PaperExchange
+    from mm.scanner import Scanner
+    ex = PaperExchange(cfg, {})
+    await ex.start()
+    try:
+        await Scanner(ex.client, cfg, ex.filters).scan()
+    finally:
+        await ex.close()
 
 
 async def main():
-    config = BotConfig()
+    args = parse_args()
+    cfg = BotConfig()
+    cfg.paper_mode = not args.live
+    if args.symbols:
+        cfg.symbols = [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
+    if args.max_symbols:
+        cfg.max_symbols = args.max_symbols
+    elif cfg.symbols:
+        cfg.max_symbols = len(cfg.symbols)
+    if args.order_usdt:
+        cfg.quote.order_usdt = args.order_usdt
+    if args.max_inventory_usdt:
+        cfg.risk.max_inventory_usdt = args.max_inventory_usdt
+    if args.paper_balance:
+        cfg.paper.balance_usdt = args.paper_balance
 
-    if not config.exchange.api_key or not config.exchange.api_secret:
-        logger.error("❌ API ключи отсутствуют в key.env")
+    setup_logging(args.log_level, cfg.log.dir)
+    log = logging.getLogger("main")
+
+    if args.scan:
+        await run_scan(cfg)
         return
 
-    if config.dry_run:
-        # Режим бумажной торговли не реализован: раньше флаг выводился в
-        # лог, но бот всё равно отправлял реальные ордера.
-        logger.error(
-            "❌ dry_run=True не поддерживается — бот торговал бы реальными "
-            "ордерами. Используйте BINANCE_TESTNET=true для проверки."
-        )
+    if not cfg.paper_mode and not (cfg.exchange.api_key and cfg.exchange.api_secret):
+        log.error("❌ Для --live нужны BINANCE_API_KEY и BINANCE_API_SECRET в key.env")
         return
 
-    logger.info("=" * 60)
-    logger.info("MULTI-SYMBOL HFT MARKET MAKER")
-    logger.info(f"Testnet: {config.exchange.testnet} | Dry: {config.dry_run}")
-    logger.info(f"Leverage: {config.exchange.leverage}x")
+    e, q, r = cfg.exchange, cfg.quote, cfg.risk
+    log.info("=" * 70)
+    log.info(f"MARKET MAKER | режим: {'LIVE' if not cfg.paper_mode else 'PAPER'}"
+             f"{' (testnet)' if e.testnet else ''}")
+    log.info(f"Монеты: {', '.join(cfg.symbols) if cfg.symbols else 'сканер'} | max {cfg.max_symbols}")
+    log.info(f"Заявка ${q.order_usdt} | макс. позиция ${r.max_inventory_usdt} | плечо {e.leverage}x")
+    log.info(f"Комиссии: maker {e.maker_fee_bps}bps taker {e.taker_fee_bps}bps | "
+             f"мин. прибыль {q.min_edge_bps}bps/fill")
+    log.info(f"Стоп {r.stop_loss_bps}bps | max hold {r.max_hold_s:.0f}с | "
+             f"стоп сессии {r.session_max_loss_pct*100:.0f}% баланса")
+    log.info("=" * 70)
 
-    manual = config.manual_symbol.strip().upper()
-    if manual:
-        logger.info(f"⚙️  РЕЖИМ: ручной | Symbol: {manual}")
-    else:
-        logger.info("🔍 РЕЖИМ: авто (сканер + детектор затухания)")
+    bot = Bot(cfg)
+    loop = asyncio.get_running_loop()
 
-    logger.info(f"Levels:   {config.strategy.num_levels} per side")
-    logger.info(
-        f"Order:    ${config.strategy.order_size_usdt} notional "
-        f"(margin ${config.strategy.order_size_usdt / config.exchange.leverage:.2f})"
-    )
-    logger.info(f"Max inv:  ${config.strategy.max_inventory_usdt}")
-    s = config.strategy
-    if s.spread_mode == "static":
-        logger.info(f"Spread:   static {s.min_half_spread_pct * 2:.2f}%")
-    else:
-        logger.info(
-            f"Spread:   dynamic {s.spread_base_half_pct * 2:.2f}%–"
-            f"{s.spread_max_half_pct * 2:.2f}%"
-        )
-    logger.info(
-        f"P&L log:  {config.pnl.csv_path} every {config.pnl.log_interval_sec}s"
-    )
-    logger.info("=" * 60)
+    def _stop():
+        log.warning("🛑 Сигнал остановки")
+        bot.running = False
 
-    bot = MultiMarketMakerBot(config)
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(sig, _stop)
+        except (NotImplementedError, RuntimeError):
+            pass      # Windows: Ctrl+C придёт как KeyboardInterrupt
     try:
         await bot.run()
-    except (KeyboardInterrupt, asyncio.CancelledError):
+    except asyncio.CancelledError:
         pass
+    finally:
+        if not bot.stopping:
+            await bot.shutdown()
 
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        print("\n👋 Бот остановлен пользователем.")
+        print("\n👋 Остановлено пользователем")

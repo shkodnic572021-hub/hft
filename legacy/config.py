@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 from typing import List
 from dotenv import load_dotenv
 
-load_dotenv(Path(__file__).parent / "key.env")
+load_dotenv(Path(__file__).parent.parent / "key.env")
 
 
 @dataclass
