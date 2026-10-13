@@ -3,9 +3,13 @@ import logging
 import os
 import time
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from typing import Dict, Optional
 
 logger = logging.getLogger(__name__)
+
+# Порог, ниже которого остаток позиции считаем нулём (накопление
+# ошибок float при сложении дробных количеств).
+QTY_EPS = 1e-9
 
 
 @dataclass
@@ -13,6 +17,7 @@ class SymbolPnL:
     symbol: str = ""
     position_qty: float = 0.0
     avg_entry: float = 0.0
+    last_mid: float = 0.0
     realized_pnl: float = 0.0
     unrealized_pnl: float = 0.0
     total_fees: float = 0.0
@@ -60,13 +65,34 @@ class PnLTracker:
             self.states[symbol] = SymbolPnL(symbol=symbol)
         return self.states[symbol]
 
-    def on_fill(self, symbol: str, side: str, fill_qty: float, fill_price: float) -> float:
+    def sync_position(self, symbol: str, position_qty: float, entry_price: float):
+        """Выравнивает позицию и цену входа по данным биржи."""
+        s = self.get_state(symbol)
+        if abs(position_qty) < QTY_EPS:
+            s.position_qty = 0.0
+            s.avg_entry = 0.0
+            s.unrealized_pnl = 0.0
+            return
+        s.position_qty = position_qty
+        if entry_price > 0:
+            s.avg_entry = entry_price
+
+    def on_fill(
+        self, symbol: str, side: str, fill_qty: float, fill_price: float,
+        fee: Optional[float] = None,
+    ) -> float:
+        """
+        Учитывает одну сделку. fill_qty/fill_price — объём и цена именно
+        этой сделки (поля l/L в ORDER_TRADE_UPDATE). fee — фактическая
+        комиссия в USDT; если None, оценивается по maker_fee_pct.
+        """
         s = self.get_state(symbol)
         signed_qty = fill_qty if side == "BUY" else -fill_qty
         s.total_fills += 1
 
         notional = fill_qty * fill_price
-        fee = notional * (self.maker_fee_pct / 100.0)
+        if fee is None:
+            fee = notional * (self.maker_fee_pct / 100.0)
         s.total_fees += fee
 
         if side == "BUY":
@@ -76,7 +102,7 @@ class PnLTracker:
 
         realized_now = 0.0
 
-        if s.position_qty == 0:
+        if abs(s.position_qty) < QTY_EPS:
             s.avg_entry = fill_price
         elif (s.position_qty > 0 and signed_qty > 0) or \
              (s.position_qty < 0 and signed_qty < 0):
@@ -91,12 +117,14 @@ class PnLTracker:
                 realized_now = (s.avg_entry - fill_price) * close_qty
             s.realized_pnl += realized_now
             remaining = fill_qty - close_qty
-            if remaining > 0:
+            if remaining > QTY_EPS:
                 s.avg_entry = fill_price
 
         s.position_qty += signed_qty
-        if s.position_qty == 0:
+        if abs(s.position_qty) < QTY_EPS:
+            s.position_qty = 0.0
             s.avg_entry = 0.0
+            s.unrealized_pnl = 0.0
 
         logger.debug(
             f"PnL {symbol}: realized_now={realized_now:+.4f} | "
@@ -106,13 +134,18 @@ class PnLTracker:
 
     def update_unrealized(self, symbol: str, mid_price: float):
         s = self.get_state(symbol)
-        if s.position_qty == 0 or s.avg_entry <= 0:
+        if mid_price > 0:
+            s.last_mid = mid_price
+        if abs(s.position_qty) < QTY_EPS or s.avg_entry <= 0 or mid_price <= 0:
             s.unrealized_pnl = 0.0
             return
         if s.position_qty > 0:
             s.unrealized_pnl = (mid_price - s.avg_entry) * s.position_qty
         else:
             s.unrealized_pnl = (s.avg_entry - mid_price) * abs(s.position_qty)
+
+    def session_net_pnl(self) -> float:
+        return sum(s.net_pnl for s in self.states.values())
 
     def log_if_due(self, prices: Dict[str, float]):
         now = time.time()
@@ -144,7 +177,7 @@ class PnLTracker:
                 w = csv.writer(f)
                 w.writerow([
                     int(time.time()), symbol, f"{s.position_qty:.8f}",
-                    f"{s.avg_entry:.6f}", f"{s.unrealized_pnl:.6f}",
+                    f"{s.avg_entry:.6f}", f"{s.last_mid:.6f}",
                     f"{s.realized_pnl:.6f}", f"{s.unrealized_pnl:.6f}",
                     f"{s.total_fees:.6f}", f"{s.net_pnl:.6f}",
                     s.total_fills, f"{s.buy_volume:.2f}", f"{s.sell_volume:.2f}"
@@ -194,7 +227,7 @@ class PnLTracker:
         logger.info(f"  Sell volume:     ${total_sell_vol:.2f}")
         logger.info(f"  Realized P&L:    {total_realized:+.4f} USDT")
         logger.info(f"  Unrealized P&L:  {total_unrealized:+.4f} USDT")
-        logger.info(f"  Fees (оценка):   {total_fees:.4f} USDT")
+        logger.info(f"  Fees:            {total_fees:.4f} USDT")
         logger.info(f"  ══════════════════════════════════")
         logger.info(f"  NET P&L:         {total_realized + total_unrealized - total_fees:+.4f} USDT")
         logger.info("=" * 70)

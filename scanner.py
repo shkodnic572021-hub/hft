@@ -1,10 +1,10 @@
 """
 Сканер монет для маркет-мейкинга.
 
-Критерии:
-- NATR 5m: 2.5–5%
-- Volume 24h ≥ $200M
-- Price change 24h ≥ +20%
+Критерии (значения задаются в config.ScannerConfig):
+- NATR 5m в диапазоне natr_min_pct–natr_max_pct
+- Volume 24h ≥ min_volume_24h_usdt
+- Price change 24h ≥ min_price_change_24h
 """
 
 import logging

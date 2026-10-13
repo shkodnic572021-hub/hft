@@ -25,7 +25,7 @@ class ScannerConfig:
     natr_max_pct: float = 3.5
     exclude_symbols: List[str] = field(default_factory=lambda: [
         "BTCUSDT", "ETHUSDT", "BNBUSDT", "USDCUSDT", "FDUSDUSDT", "TUSDUSDT",
-        "USDCUSDT", "BUSDUSDT", "DAIUSDT", "EURUSDT",
+        "BUSDUSDT", "DAIUSDT", "EURUSDT",
     ])
     scan_interval_sec: int = 300
     fading_check_interval_sec: int = 60
@@ -47,6 +47,7 @@ class StrategyConfig:
     min_order_lifetime_sec: float = 0.5
     tp_offset_pct: float = 0.2
     max_inventory_usdt: float = 12.0
+    # Доля баланса (0.10 = 10%): при таком убытке сессии бот останавливается
     max_drawdown_pct: float = 0.10
     max_latency_ms: float = 500.0
 

@@ -1,9 +1,18 @@
 """
-HFT маркет-мейкер с Storm Mode (v5).
+HFT маркет-мейкер с Storm Mode (v6).
 
 Изменения v5:
 - Динамическое плечо (min(requested, symbol_max))
 - Обработка -2027 → hard_kill символа (не спамить)
+
+Изменения v6 (исправления ошибок):
+- Позиция и P&L считаются по последней сделке (l/L), а не по
+  накопленному объёму ордера (z/ap) — раньше при частичных исполнениях
+  позиция задваивалась
+- Цены и объёмы отправляются в десятичной записи (без 1e-05)
+- Синхронизация позиции с биржей обновляет и P&L-трекер
+- Защиты (loss stop, max drawdown) работают по актуальному unrealized
+- Ротации сериализованы, HARD KILL закрывает позицию
 """
 
 import asyncio
@@ -11,6 +20,7 @@ import json
 import logging
 import math
 import secrets
+import signal
 import time
 from collections import deque
 from decimal import Decimal, ROUND_DOWN
@@ -58,7 +68,8 @@ class AvellanedaStoikovModel:
         return mid - risk_term
 
     def optimal_spread(self, mid: float, t_left: float) -> float:
-        if self.sigma_log <= 0 or t_left <= 0:
+        # kappa — в относительных единицах (1 / spread_pct), см. calibrator
+        if self.sigma_log <= 0 or self.kappa <= 1e-6 or t_left <= 0:
             return 0.0
         s_price = self._sigma_price(mid)
         risk_part = self.gamma * (s_price ** 2) * t_left
@@ -118,26 +129,43 @@ class SymbolState:
         self.spread_count = 0
         self.btc_count = 0
 
-        # --- Lock ---
+        # --- Sync с биржей ---
+        self.pos_mismatch_count = 0
+
+        # --- Locks ---
         self.grid_lock = asyncio.Lock()
+        self.tp_lock = asyncio.Lock()
+
+    @staticmethod
+    def _round_to_step(value: float, step_f: float, rounding=ROUND_DOWN) -> Decimal:
+        step = Decimal(str(step_f))
+        if step <= 0:
+            return Decimal(str(value))
+        steps = (Decimal(str(value)) / step).quantize(
+            Decimal("1"), rounding=rounding
+        )
+        return steps * step
+
+    @staticmethod
+    def _fmt(d: Decimal) -> str:
+        # Всегда обычная десятичная запись: str(1e-05) == '1e-05',
+        # такой формат Binance отклоняет.
+        s = format(d, "f")
+        if "." in s:
+            s = s.rstrip("0").rstrip(".")
+        return s or "0"
 
     def round_price(self, price: float) -> float:
-        tick = Decimal(str(self.tick_size))
-        if tick <= 0:
-            return price
-        steps = (Decimal(str(price)) / tick).quantize(
-            Decimal("1"), rounding=ROUND_DOWN
-        )
-        return float(steps * tick)
+        return float(self._round_to_step(price, self.tick_size))
 
     def round_qty(self, qty: float) -> float:
-        step = Decimal(str(self.lot_size))
-        if step <= 0:
-            return qty
-        steps = (Decimal(str(qty)) / step).quantize(
-            Decimal("1"), rounding=ROUND_DOWN
-        )
-        return float(steps * step)
+        return float(self._round_to_step(qty, self.lot_size))
+
+    def fmt_price(self, price: float) -> str:
+        return self._fmt(self._round_to_step(price, self.tick_size))
+
+    def fmt_qty(self, qty: float) -> str:
+        return self._fmt(self._round_to_step(qty, self.lot_size))
 
     @staticmethod
     def make_grid_cid() -> str:
@@ -165,8 +193,21 @@ class MultiMarketMakerBot:
 
         self.btc_price_history = deque(maxlen=300)
 
+        # Ротации (scanner_loop и fading_monitor) не должны идти параллельно:
+        # бот рассчитан на одну монету одновременно.
+        self._rotation_lock = asyncio.Lock()
+        # Ссылки на фоновые задачи, чтобы их не собрал GC.
+        self._bg_tasks: Set[asyncio.Task] = set()
+
         self.is_running = False
         self.initial_balance = 0.0
+        self.drawdown_triggered = False
+
+    def _spawn(self, coro) -> asyncio.Task:
+        task = asyncio.create_task(coro)
+        self._bg_tasks.add(task)
+        task.add_done_callback(self._bg_tasks.discard)
+        return task
 
     async def initialize(self):
         self.client = await AsyncClient.create(
@@ -188,8 +229,13 @@ class MultiMarketMakerBot:
         """
         try:
             brackets = await self.client.futures_leverage_bracket(symbol=symbol)
-            if brackets and len(brackets) > 0:
-                b = brackets[0].get("brackets", [])
+            # С параметром symbol Binance может вернуть объект, а не список
+            if isinstance(brackets, dict):
+                brackets = [brackets]
+            for item in brackets or []:
+                if item.get("symbol", symbol) != symbol:
+                    continue
+                b = item.get("brackets", [])
                 if b:
                     return int(b[0].get("initialLeverage", 1))
         except BinanceAPIException as e:
@@ -205,6 +251,12 @@ class MultiMarketMakerBot:
         min_notional = 0.0
         for s in info["symbols"]:
             if s["symbol"] == symbol:
+                if s.get("status", "TRADING") != "TRADING":
+                    logger.error(f"❌ {symbol}: статус {s.get('status')}, не торгуется")
+                    return None
+                if s.get("contractType", "PERPETUAL") != "PERPETUAL":
+                    logger.error(f"❌ {symbol}: не бессрочный контракт")
+                    return None
                 for f in s["filters"]:
                     if f["filterType"] == "PRICE_FILTER":
                         tick_size = float(f["tickSize"])
@@ -280,6 +332,11 @@ class MultiMarketMakerBot:
             if p["symbol"] == symbol:
                 state.position_qty = float(p["positionAmt"])
                 state.position_usdt = abs(state.position_qty) * float(p["markPrice"])
+                # Позиция могла остаться с прошлого запуска — без цены входа
+                # TP не выставится, а стопы не сработают.
+                self.pnl.sync_position(
+                    symbol, state.position_qty, float(p.get("entryPrice", 0) or 0)
+                )
                 break
 
         try:
@@ -333,26 +390,31 @@ class MultiMarketMakerBot:
             positions = await self.client.futures_position_information(symbol=symbol)
             for p in positions:
                 if p["symbol"] == symbol:
-                    real_qty = float(p["positionAmt"])
-                    if abs(real_qty) > 0:
-                        position_qty = real_qty
+                    # Биржа — источник истины: если там 0, закрывать нечего
+                    # (иначе reduceOnly-ордер получит отказ -2022).
+                    position_qty = float(p["positionAmt"])
                     break
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(f"{symbol}: close — позиция не получена ({e})")
+
+        if position_qty == 0:
+            return
 
         state = self.states.get(symbol)
         side = SIDE_SELL if position_qty > 0 else SIDE_BUY
         qty = abs(position_qty)
-        if state is not None:
-            qty = state.round_qty(qty)
-        if qty <= 0:
+        qty_str = (
+            state.fmt_qty(qty) if state is not None
+            else SymbolState._fmt(Decimal(repr(qty)))
+        )
+        if float(qty_str) <= 0:
             return
         try:
             await self.client.futures_create_order(
                 symbol=symbol, side=side, type="MARKET",
-                quantity=str(qty), reduceOnly=True,
+                quantity=qty_str, reduceOnly="true",
             )
-            logger.info(f"🔒 {symbol}: MARKET {side} {qty}")
+            logger.info(f"🔒 {symbol}: MARKET {side} {qty_str}")
         except BinanceAPIException as e:
             logger.error(f"❌ {symbol}: close — {e}")
 
@@ -381,15 +443,22 @@ class MultiMarketMakerBot:
 
     async def stream_order_books(self):
         active: Dict[str, asyncio.Task] = {}
-        while self.is_running:
-            for sym in list(self.states.keys()):
-                if sym not in active or active[sym].done():
-                    active[sym] = asyncio.create_task(self._stream_single_depth(sym))
-            for sym in list(active.keys()):
-                if sym not in self.states:
-                    active[sym].cancel()
-                    del active[sym]
-            await asyncio.sleep(1)
+        try:
+            while self.is_running:
+                for sym in list(self.states.keys()):
+                    if sym not in active or active[sym].done():
+                        active[sym] = asyncio.create_task(
+                            self._stream_single_depth(sym)
+                        )
+                for sym in list(active.keys()):
+                    if sym not in self.states:
+                        active[sym].cancel()
+                        del active[sym]
+                await asyncio.sleep(1)
+        finally:
+            # При остановке дочерние WS-задачи иначе остались бы висеть
+            for t in active.values():
+                t.cancel()
 
     async def _stream_single_depth(self, symbol: str):
         base_url = ("wss://stream.binancefuture.com/ws"
@@ -452,9 +521,10 @@ class MultiMarketMakerBot:
             pass
 
         state.calibrator.update(state.mid_price, spread)
-        sigma, kappa = state.calibrator.get_params()
-        state.model.update_sigma(sigma)
-        state.model.update_kappa(kappa)
+        if state.calibrator.ready:
+            sigma, kappa = state.calibrator.get_params()
+            state.model.update_sigma(sigma)
+            state.model.update_kappa(kappa)
 
         if not state._mid_logged:
             logger.info(f"📊 {symbol}: mid={state.mid_price:.6f} spread={spread:.6f}")
@@ -667,7 +737,15 @@ class MultiMarketMakerBot:
                 async with socket as stream:
                     while self.is_running:
                         msg = await stream.recv()
-                        if msg.get("e") == "ORDER_TRADE_UPDATE":
+                        if not isinstance(msg, dict):
+                            continue
+                        event = msg.get("e")
+                        if event == "error":
+                            # python-binance не бросает исключение, а шлёт
+                            # такое сообщение — без переподключения поток
+                            # молча умрёт и бот перестанет видеть fills.
+                            raise RuntimeError(msg.get("m", "user stream error"))
+                        if event == "ORDER_TRADE_UPDATE":
                             await self._handle_order_update(msg)
             except asyncio.CancelledError:
                 return
@@ -688,57 +766,78 @@ class MultiMarketMakerBot:
     async def _handle_order_update(self, msg: dict):
         order = msg.get("o", {})
         status = order.get("X", "")
+        exec_type = order.get("x", "")
         client_id = order.get("c", "")
         symbol = order.get("s", "")
 
+        # Объём и цена ИМЕННО этой сделки. z/ap — накопленный объём и
+        # средняя цена всего ордера: при частичных исполнениях их нельзя
+        # прибавлять к позиции, иначе она задваивается.
+        try:
+            last_qty = float(order.get("l", 0) or 0)
+            last_price = float(order.get("L", 0) or 0)
+        except (TypeError, ValueError):
+            last_qty, last_price = 0.0, 0.0
+        side = order.get("S", "")
+        is_trade = exec_type == "TRADE" and last_qty > 0 and last_price > 0
+
+        fee = None
+        if is_trade:
+            try:
+                if order.get("N") == self.cfg.scanner.quote_asset:
+                    fee = float(order.get("n", 0) or 0)
+            except (TypeError, ValueError):
+                fee = None
+
         state = self.states.get(symbol)
         if state is None:
+            # Символ уже убран (ротация), но закрывающие сделки всё равно
+            # должны попасть в P&L, иначе там останется «висящая» позиция.
+            if is_trade:
+                self.pnl.on_fill(
+                    symbol=symbol, side="BUY" if side == SIDE_BUY else "SELL",
+                    fill_qty=last_qty, fill_price=last_price, fee=fee,
+                )
             return
 
-        if status in ("FILLED", "PARTIALLY_FILLED"):
-            filled_qty = float(order.get("z", 0))
-            avg_price = float(order.get("ap", 0))
-            last_filled_qty = float(order.get("l", 0))
-            side = order.get("S", "")
+        if is_trade:
+            async with self._state_lock:
+                old_pos = state.position_qty
+                delta = last_qty if side == SIDE_BUY else -last_qty
+                new_pos = round(old_pos + delta, 10)
+                if abs(new_pos) < 1e-9:
+                    new_pos = 0.0
+                state.position_qty = new_pos
+                ref_price = state.mid_price if state.mid_price > 0 else last_price
+                state.position_usdt = abs(new_pos) * ref_price
+                state.total_fills += 1
 
-            if filled_qty > 0 and avg_price > 0:
-                async with self._state_lock:
-                    old_pos = state.position_qty
-                    if side == SIDE_BUY:
-                        state.position_qty += filled_qty
-                    else:
-                        state.position_qty -= filled_qty
-                    new_pos = state.position_qty
-                    state.position_usdt = abs(new_pos) * state.mid_price
-                    state.total_fills += 1
+            realized = self.pnl.on_fill(
+                symbol=symbol,
+                side="BUY" if side == SIDE_BUY else "SELL",
+                fill_qty=last_qty, fill_price=last_price, fee=fee,
+            )
+            is_opening = self._is_opening_fill(old_pos, new_pos, side)
+            is_tp = (
+                client_id in state.tp_order_ids
+                or client_id.startswith("t_")
+            )
 
-                fill_delta = last_filled_qty if last_filled_qty > 0 else filled_qty
-                realized = self.pnl.on_fill(
-                    symbol=symbol,
-                    side="BUY" if side == SIDE_BUY else "SELL",
-                    fill_qty=fill_delta, fill_price=avg_price,
+            logger.info(
+                f"💥 {symbol} FILL: {side} {last_qty} @ {last_price} | "
+                f"Pos: {new_pos:.4f} (${state.position_usdt:.2f}) | "
+                f"real={realized:+.4f}"
+                + (" [OPENING]" if is_opening else " [CLOSING]")
+                + (" [TP]" if is_tp else "")
+            )
+
+            if is_opening and not is_tp and not state.hard_kill:
+                await self._place_tp_for_fill(
+                    state, side, last_qty, last_price
                 )
-                is_opening = self._is_opening_fill(old_pos, new_pos, side)
-                is_tp = (
-                    client_id in state.tp_order_ids
-                    or client_id.startswith("t_")
-                )
 
-                logger.info(
-                    f"💥 {symbol} FILL: {side} {fill_delta} @ {avg_price} | "
-                    f"Pos: {new_pos:.4f} (${state.position_usdt:.2f}) | "
-                    f"real={realized:+.4f}"
-                    + (" [OPENING]" if is_opening else " [CLOSING]")
-                    + (" [TP]" if is_tp else "")
-                )
-
-                if is_opening and not is_tp:
-                    await self._place_tp_for_fill(
-                        state, side, fill_delta, avg_price
-                    )
-
-                if new_pos == 0 and state.tp_order_ids:
-                    await self._cancel_all_tps(state, "pos = 0")
+            if new_pos == 0 and state.tp_order_ids:
+                await self._cancel_all_tps(state, "pos = 0")
 
         if status == "PARTIALLY_FILLED":
             if client_id in state.grid_order_ids:
@@ -749,7 +848,7 @@ class MultiMarketMakerBot:
                 except Exception:
                     pass
 
-        if status in ("CANCELED", "EXPIRED", "FILLED"):
+        if status in ("CANCELED", "EXPIRED", "FILLED", "REJECTED"):
             state.grid_order_ids.discard(client_id)
             state.tp_order_ids.pop(client_id, None)
 
@@ -760,6 +859,12 @@ class MultiMarketMakerBot:
         return new_pos < 0 and (old_pos >= 0 or new_pos < old_pos)
 
     async def _place_tp_for_fill(self, state, fill_side, fill_qty, fill_price):
+        # Лок: обработчик fill и tp_watchdog могут выставлять TP
+        # одновременно — без него на бирже появлялись дубли TP.
+        async with state.tp_lock:
+            await self._place_tp_locked(state)
+
+    async def _place_tp_locked(self, state):
         tp_pct = self.cfg.strategy.tp_offset_pct / 100.0
         pnl_state = self.pnl.get_state(state.symbol)
         if pnl_state.avg_entry <= 0:
@@ -777,8 +882,10 @@ class MultiMarketMakerBot:
         else:
             return
 
-        tp_price = state.round_price(tp_price)
-        tp_qty = state.round_qty(abs(state.position_qty))
+        price_str = state.fmt_price(tp_price)
+        qty_str = state.fmt_qty(abs(state.position_qty))
+        tp_price = float(price_str)
+        tp_qty = float(qty_str)
         if tp_price <= 0 or tp_qty <= 0:
             return
 
@@ -787,8 +894,8 @@ class MultiMarketMakerBot:
             order = await self.client.futures_create_order(
                 symbol=state.symbol, side=tp_side,
                 type=ORDER_TYPE_LIMIT, timeInForce=TIME_IN_FORCE_GTC,
-                price=str(tp_price), quantity=str(tp_qty),
-                reduceOnly=True, newClientOrderId=cid,
+                price=price_str, quantity=qty_str,
+                reduceOnly="true", newClientOrderId=cid,
             )
             real_cid = order.get("clientOrderId", cid)
             state.tp_order_ids[real_cid] = {
@@ -796,7 +903,7 @@ class MultiMarketMakerBot:
                 "price": tp_price, "entry": entry,
             }
             logger.info(
-                f"🎯 {state.symbol} TP {tp_side} {tp_qty} @ {tp_price} "
+                f"🎯 {state.symbol} TP {tp_side} {qty_str} @ {price_str} "
                 f"(avg={entry:.6f}, +{self.cfg.strategy.tp_offset_pct}%)"
             )
         except BinanceAPIException as e:
@@ -818,27 +925,41 @@ class MultiMarketMakerBot:
                         symbol=symbol
                     )
                     real_pos = 0.0
+                    real_entry = 0.0
                     for p in pos_info:
                         if p["symbol"] == symbol:
                             real_pos = float(p["positionAmt"])
+                            real_entry = float(p.get("entryPrice", 0) or 0)
                             break
 
+                    # Расхождение должно продержаться две проверки подряд:
+                    # REST может показать сделку раньше, чем придёт событие
+                    # по WS, и тогда мгновенная «синхронизация» + fill
+                    # из WS посчитали бы её дважды.
                     if abs(real_pos - state.position_qty) > 1e-9:
+                        state.pos_mismatch_count += 1
+                    else:
+                        state.pos_mismatch_count = 0
+
+                    if state.pos_mismatch_count >= 2:
                         logger.info(
                             f"🔄 {symbol}: sync pos "
                             f"{state.position_qty:.4f} → {real_pos:.4f}"
                         )
                         state.position_qty = real_pos
                         state.position_usdt = abs(real_pos) * state.mid_price
+                        state.pos_mismatch_count = 0
+                        self.pnl.sync_position(symbol, real_pos, real_entry)
 
                     open_orders = await self.client.futures_get_open_orders(
                         symbol=symbol
                     )
                     open_cids = {o.get("clientOrderId", "") for o in open_orders}
+                    # Только наши TP: reduceOnly-ордера сетки в reduce mode
+                    # тоже reduceOnly, но это не тейк-профит.
                     tp_on_exchange = [
                         o for o in open_orders
-                        if (o.get("clientOrderId", "").startswith("t_")
-                            or o.get("reduceOnly"))
+                        if o.get("clientOrderId", "").startswith("t_")
                     ]
 
                     for c in [c for c in list(state.tp_order_ids.keys())
@@ -846,6 +967,7 @@ class MultiMarketMakerBot:
                         state.tp_order_ids.pop(c, None)
 
                     if (abs(real_pos) > 0
+                            and abs(real_pos - state.position_qty) <= 1e-9
                             and not tp_on_exchange
                             and not state.hard_kill):
                         pnl_state = self.pnl.get_state(symbol)
@@ -887,7 +1009,9 @@ class MultiMarketMakerBot:
 
         half_pct = self._calculate_half_spread_pct(state)
         min_half_spread = state.mid_price * (half_pct / 100.0)
-        half_spread = max(spread / 2.0, min_half_spread)
+        max_half_spread = state.mid_price * (cfg.spread_max_half_pct / 100.0)
+        # A-S часть ограничиваем сверху так же, как динамический спред
+        half_spread = max(min(spread / 2.0, max_half_spread), min_half_spread)
 
         logger.debug(
             f"{state.symbol}: half_spread={half_pct:.3f}% "
@@ -914,13 +1038,7 @@ class MultiMarketMakerBot:
         inv_abs = abs(state.position_usdt)
 
         if inv_abs >= inv_limit * 1.5:
-            if not state.hard_kill:
-                logger.critical(
-                    f"🚨 {state.symbol}: HARD KILL (${inv_abs:.2f})"
-                )
-                state.hard_kill = True
-                state.reduce_mode = True
-                await self._cancel_grid_orders(state)
+            await self._hard_kill(state, f"inventory ${inv_abs:.2f}")
             return
 
         prev_reduce = state.reduce_mode
@@ -934,7 +1052,10 @@ class MultiMarketMakerBot:
                 logger.info(f"✅ {state.symbol}: REDUCE MODE OFF")
 
         if inv_abs > inv_limit * 0.8 and not state.reduce_mode:
-            skew = (state.position_usdt / inv_limit) * state.tick_size * 10
+            # Знак важен: position_usdt — модуль, поэтому раньше и лонг,
+            # и шорт сдвигали котировки вниз. Шорт должен сдвигать вверх.
+            signed_usdt = math.copysign(inv_abs, state.position_qty)
+            skew = (signed_usdt / inv_limit) * state.tick_size * 10
             bid_base -= skew
             ask_base -= skew
 
@@ -1006,6 +1127,25 @@ class MultiMarketMakerBot:
                     )
                     await self._cancel_grid_orders(state)
 
+    async def _hard_kill(self, state: SymbolState, reason: str, force: bool = False):
+        """
+        Останавливает торговлю символом: снимает сетку, TP и закрывает
+        позицию по рынку. Раньше HARD KILL по инвентарю только снимал
+        сетку, а позиция оставалась открытой без восстановления TP.
+        Символ остаётся выключенным до ротации или перезапуска.
+        """
+        if state.hard_kill and not force:
+            return
+        state.hard_kill = True
+        state.reduce_mode = True
+        logger.critical(f"🚨 {state.symbol}: HARD KILL ({reason})")
+        async with state.grid_lock:
+            await self._cancel_grid_orders(state)
+        await self._close_position_market(state.symbol, state.position_qty)
+        await self._cancel_all_tps(state, "hard kill")
+        if state.mid_price > 0:
+            self.pnl.force_log(state.symbol, state.mid_price)
+
     async def _place_grid(self, state, side, price, qty, reduce_only=False) -> bool:
         if price <= 0 or qty <= 0:
             return False
@@ -1016,11 +1156,11 @@ class MultiMarketMakerBot:
             kwargs = dict(
                 symbol=state.symbol, side=side,
                 type=ORDER_TYPE_LIMIT, timeInForce=TIME_IN_FORCE_GTX,
-                price=str(price), quantity=str(qty),
+                price=state.fmt_price(price), quantity=state.fmt_qty(qty),
                 newClientOrderId=cid,
             )
             if reduce_only:
-                kwargs["reduceOnly"] = True
+                kwargs["reduceOnly"] = "true"
 
             order = await self.client.futures_create_order(**kwargs)
             state.last_latency_ms = (time.perf_counter() - t0) * 1000
@@ -1042,16 +1182,12 @@ class MultiMarketMakerBot:
             # -2027: превышен максимум позиции — стоп спам
             if code == -2027 or "maximum allowable position" in err_lower:
                 if not state.hard_kill:
-                    logger.critical(
-                        f"🚨 {state.symbol}: -2027 (max position exceeded) "
-                        f"— HARD KILL, cancelling grid + closing position"
-                    )
+                    # Вызов идёт изнутри grid_lock — сам hard kill
+                    # запускаем фоном, иначе будет deadlock на локе.
                     state.hard_kill = True
-                    state.reduce_mode = True
-                    asyncio.create_task(self._cancel_grid_orders(state))
-                    asyncio.create_task(
-                        self._close_position_market(state.symbol, state.position_qty)
-                    )
+                    self._spawn(self._hard_kill(
+                        state, "-2027 max position exceeded", force=True
+                    ))
                 return False
 
             # -5022 GTX post-only
@@ -1120,7 +1256,7 @@ class MultiMarketMakerBot:
             if local_max > 0 and current_natr < local_max / cfg.natr_drop_factor:
                 return True, (
                     f"NATR drop: {current_natr:.2f}% < "
-                    f"{local_max:.2f}%/4"
+                    f"{local_max:.2f}%/{cfg.natr_drop_factor:g}"
                 )
 
         return False, ""
@@ -1138,6 +1274,16 @@ class MultiMarketMakerBot:
         return None
 
     async def _rotate_to_symbol(self, old_symbol: str, new_symbol: str):
+        async with self._rotation_lock:
+            if old_symbol not in self.states:
+                # Пока ждали лок, монету уже сменила другая ротация
+                logger.info(f"🔄 {old_symbol}: ротация уже выполнена, пропуск")
+                return
+            if new_symbol in self.states:
+                return
+            await self._rotate_locked(old_symbol, new_symbol)
+
+    async def _rotate_locked(self, old_symbol: str, new_symbol: str):
         logger.warning(f"🔄 ROTATION: {old_symbol} → {new_symbol}")
         state = self.states.get(old_symbol)
         if state:
@@ -1193,7 +1339,12 @@ class MultiMarketMakerBot:
                     continue
                 try:
                     fading, reason = await self._check_fading(state)
-                    if fading and not state.fading:
+                    if not fading and state.fading:
+                        # Раньше флаг не сбрасывался никогда: если замену
+                        # не нашли, монета навсегда оставалась без котировок.
+                        logger.info(f"🌤️  {symbol}: активность восстановилась")
+                        state.fading = False
+                    elif fading and not state.fading:
                         logger.warning(f"🌫️  {symbol}: FADING — {reason}")
                         state.fading = True
                         new_sym = await self._find_better_symbol(
@@ -1226,11 +1377,13 @@ class MultiMarketMakerBot:
                 top_symbols = {c.symbol for c in top}
 
                 if not self.states:
-                    new_state = await self._prepare_symbol(best.symbol)
-                    if new_state:
-                        async with self._state_lock:
-                            self.states[best.symbol] = new_state
-                        logger.info(f"✅ Приняли {best.symbol} в работу")
+                    async with self._rotation_lock:
+                        if not self.states:
+                            new_state = await self._prepare_symbol(best.symbol)
+                            if new_state:
+                                async with self._state_lock:
+                                    self.states[best.symbol] = new_state
+                                logger.info(f"✅ Приняли {best.symbol} в работу")
                     continue
 
                 current_sym = list(self.states.keys())[0]
@@ -1280,8 +1433,19 @@ class MultiMarketMakerBot:
                 st = self.states.get(sym)
                 if st and st.mid_price > 0:
                     prices[sym] = st.mid_price
+            # unrealized и position_usdt пересчитываем каждый цикл: раньше
+            # unrealized обновлялся раз в 60 с (только для лога), и loss stop
+            # смотрел на устаревшие данные.
+            for sym, mid in prices.items():
+                self.pnl.update_unrealized(sym, mid)
+                st = self.states.get(sym)
+                if st is not None:
+                    st.position_usdt = abs(st.position_qty) * mid
             if prices:
                 self.pnl.log_if_due(prices)
+
+            if await self._check_max_drawdown():
+                return
 
             if self.cfg.storm.enabled:
                 pos_stop = self.cfg.storm.position_stop_pct / 100.0
@@ -1289,7 +1453,7 @@ class MultiMarketMakerBot:
                     state = self.states.get(symbol)
                     if state is None or state.rotating or state.storm_mode:
                         continue
-                    if abs(state.position_qty) < 1e-9:
+                    if abs(state.position_qty) < 1e-9 or state.mid_price <= 0:
                         continue
                     pnl_state = self.pnl.get_state(symbol)
                     avg = pnl_state.avg_entry
@@ -1322,23 +1486,17 @@ class MultiMarketMakerBot:
                 )
                 for symbol in list(self.states.keys()):
                     state = self.states.get(symbol)
-                    if state is None or state.rotating or state.storm_mode:
+                    if (state is None or state.rotating or state.storm_mode
+                            or state.hard_kill):
                         continue
                     pnl_state = self.pnl.get_state(symbol)
                     unreal = pnl_state.unrealized_pnl
                     if unreal < threshold and abs(state.position_usdt) > 0:
-                        logger.critical(
-                            f"🛑 {symbol}: LOSS STOP "
-                            f"(unrealized ${unreal:.2f} < "
-                            f"${threshold:.2f})"
+                        await self._hard_kill(
+                            state,
+                            f"LOSS STOP: unrealized ${unreal:.2f} < "
+                            f"${threshold:.2f}",
                         )
-                        await self._cancel_grid_orders(state)
-                        await self._close_position_market(
-                            symbol, state.position_qty
-                        )
-                        await self._cancel_all_tps(state, "loss stop")
-                        state.hard_kill = True
-                        state.reduce_mode = True
 
             tasks = []
             for symbol in symbols:
@@ -1348,12 +1506,9 @@ class MultiMarketMakerBot:
                 if (abs(state.position_usdt)
                         >= self.cfg.strategy.max_inventory_usdt * 1.5):
                     if not state.hard_kill:
-                        logger.critical(f"🚨 {symbol}: HARD KILL")
-                        state.hard_kill = True
-                        state.reduce_mode = True
-                        await self._cancel_grid_orders(state)
-                        if state.mid_price > 0:
-                            self.pnl.force_log(symbol, state.mid_price)
+                        await self._hard_kill(
+                            state, f"inventory ${state.position_usdt:.2f}"
+                        )
                     continue
                 tasks.append(self._update_symbol_quotes(state))
 
@@ -1361,12 +1516,34 @@ class MultiMarketMakerBot:
                 await asyncio.gather(*tasks, return_exceptions=True)
             await asyncio.sleep(self.cfg.strategy.min_order_lifetime_sec)
 
+    async def _check_max_drawdown(self) -> bool:
+        """
+        Общий стоп сессии по strategy.max_drawdown_pct (доля баланса,
+        0.10 = 10%). Раньше параметр был в конфиге, но нигде не
+        использовался. При срабатывании бот останавливается, позиции
+        закрываются в _shutdown_safe.
+        """
+        limit = self.cfg.strategy.max_drawdown_pct
+        if self.drawdown_triggered or limit <= 0 or self.initial_balance <= 0:
+            return self.drawdown_triggered
+        net = self.pnl.session_net_pnl()
+        if net < -self.initial_balance * limit:
+            self.drawdown_triggered = True
+            logger.critical(
+                f"🛑 MAX DRAWDOWN: P&L сессии {net:+.2f} USDT "
+                f"< -{limit*100:.1f}% баланса — останавливаю бота"
+            )
+            self.is_running = False
+            return True
+        return False
+
     async def _shutdown_safe(self, tasks: list):
         logger.info("=" * 60)
         logger.info("🔻 GRACEFUL SHUTDOWN")
         logger.info("=" * 60)
         self.is_running = False
 
+        tasks = list(tasks) + list(self._bg_tasks)
         for t in tasks:
             t.cancel()
         try:
@@ -1427,6 +1604,14 @@ class MultiMarketMakerBot:
 
     async def run(self):
         self.is_running = True
+        # SIGTERM (systemd, docker stop, kill) раньше убивал процесс без
+        # graceful shutdown — ордера и позиции оставались на бирже.
+        try:
+            asyncio.get_running_loop().add_signal_handler(
+                signal.SIGTERM, self._on_sigterm
+            )
+        except (NotImplementedError, RuntimeError):
+            pass  # Windows: сигналы в event loop не поддерживаются
         await self.initialize()
 
         manual = self.cfg.manual_symbol.strip().upper()
@@ -1478,6 +1663,10 @@ class MultiMarketMakerBot:
                 await self._shutdown_safe(tasks)
             except Exception as e:
                 logger.exception(f"shutdown error: {e}")
+
+    def _on_sigterm(self):
+        logger.warning("🛑 SIGTERM — останавливаюсь")
+        self.is_running = False
 
     async def stop(self):
         self.is_running = False

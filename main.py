@@ -18,6 +18,15 @@ async def main():
         logger.error("❌ API ключи отсутствуют в key.env")
         return
 
+    if config.dry_run:
+        # Режим бумажной торговли не реализован: раньше флаг выводился в
+        # лог, но бот всё равно отправлял реальные ордера.
+        logger.error(
+            "❌ dry_run=True не поддерживается — бот торговал бы реальными "
+            "ордерами. Используйте BINANCE_TESTNET=true для проверки."
+        )
+        return
+
     logger.info("=" * 60)
     logger.info("MULTI-SYMBOL HFT MARKET MAKER")
     logger.info(f"Testnet: {config.exchange.testnet} | Dry: {config.dry_run}")
@@ -35,10 +44,14 @@ async def main():
         f"(margin ${config.strategy.order_size_usdt / config.exchange.leverage:.2f})"
     )
     logger.info(f"Max inv:  ${config.strategy.max_inventory_usdt}")
-    logger.info(
-        f"Spread:   {config.strategy.min_half_spread_pct * 2:.2f}% "
-        f"between best bid/ask"
-    )
+    s = config.strategy
+    if s.spread_mode == "static":
+        logger.info(f"Spread:   static {s.min_half_spread_pct * 2:.2f}%")
+    else:
+        logger.info(
+            f"Spread:   dynamic {s.spread_base_half_pct * 2:.2f}%–"
+            f"{s.spread_max_half_pct * 2:.2f}%"
+        )
     logger.info(
         f"P&L log:  {config.pnl.csv_path} every {config.pnl.log_interval_sec}s"
     )
