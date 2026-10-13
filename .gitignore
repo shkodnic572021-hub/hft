@@ -1,0 +1,14 @@
+# Секреты — никогда не коммитить
+key.env
+*.env
+.env
+
+# Логи и артефакты работы бота
+pnl_log.csv
+*.log
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
